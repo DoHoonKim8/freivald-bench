@@ -64,6 +64,14 @@ name = "primitives"
 harness = false
 
 [[bench]]
+name = "freivalds"
+harness = false
+
+[[bench]]
+name = "dot_product"
+harness = false
+
+[[bench]]
 name = "poseidon"
 harness = false
 

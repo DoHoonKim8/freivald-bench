@@ -23,5 +23,6 @@
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
 
+pub mod mat_mul;
 pub mod poseidon;
 pub mod utilities;

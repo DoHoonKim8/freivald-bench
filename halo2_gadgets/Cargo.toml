@@ -79,3 +79,7 @@ harness = false
 name = "sha256"
 harness = false
 required-features = ["unstable"]
+
+[[bench]]
+name = "mat_mul"
+harness = false

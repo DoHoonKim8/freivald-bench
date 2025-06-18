@@ -118,8 +118,8 @@ impl<F: Field> DotProductCircuit<F> {
 #[allow(non_snake_case)]
 impl<F: Field> Circuit<F> for DotProductCircuit<F> {
     // This is to match the number of advice columns in Freivalds; here,
-    // we have 4 * 2 = 8 advice columns; while Freivalds has 7 advice columns
-    type Config = [DotProductConfig; 4];
+    // we have 3 * 3 = 9 advice columns; while Freivalds has 7 advice columns
+    type Config = [DotProductConfig; 3];
     type FloorPlanner = V1;
     #[cfg(feature = "circuit-params")]
     type Params = ();
@@ -133,7 +133,6 @@ impl<F: Field> Circuit<F> for DotProductCircuit<F> {
             DotProductConfig::configure(meta),
             DotProductConfig::configure(meta),
             DotProductConfig::configure(meta),
-            DotProductConfig::configure(meta),
         ]
     }
 
@@ -142,7 +141,7 @@ impl<F: Field> Circuit<F> for DotProductCircuit<F> {
         config: Self::Config,
         mut layouter: impl Layouter<F>,
     ) -> Result<(), Error> {
-        let chunk_size = (self.values.len() as u32).div_ceil(4) as usize;
+        let chunk_size = (self.values.len() as u32).div_ceil(3) as usize;
         for (chunk_idx, chunk) in self.values.chunks(chunk_size).enumerate() {
             let config = config[chunk_idx];
             for (a, b) in chunk.iter() {

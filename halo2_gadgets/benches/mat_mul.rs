@@ -47,7 +47,11 @@ impl ParamsKZGCache {
 fn freivalds_setup<'a>(
     N: usize,
     cache: &'a mut ParamsKZGCache,
-) -> (&'a ParamsKZG<Bn256>, FreivaldCircuit<Fr>, ProvingKey<G1Affine>) {
+) -> (
+    &'a ParamsKZG<Bn256>,
+    FreivaldCircuit<Fr>,
+    ProvingKey<G1Affine>,
+) {
     let K = log2_floor(N * N - 1) + 1;
     let params = cache.fetch_params(K);
 
@@ -99,9 +103,17 @@ fn run_freivalds(
 fn dot_product_setup(
     N: usize,
     cache: &mut ParamsKZGCache,
-) -> (&ParamsKZG<Bn256>, DotProductCircuit<Fr>, ProvingKey<G1Affine>) {
-    // current dot product circuit divides vector sets into 4 chunks
-    let K = log2_floor((((N * N * N) as u32).div_ceil(4) - 1).try_into().unwrap()) + 1;
+) -> (
+    &ParamsKZG<Bn256>,
+    DotProductCircuit<Fr>,
+    ProvingKey<G1Affine>,
+) {
+    // current dot product circuit divides vector sets into 3 chunks
+    let K = log2_floor(
+        ((N as u32 * ((N * N) as u32).div_ceil(3)) - 1)
+            .try_into()
+            .unwrap(),
+    ) + 1;
     let params = cache.fetch_params(K);
     // should set up the circuit for N^2 dot products
     let values = (0..N * N)
@@ -145,7 +157,8 @@ fn run_dot_product(
 #[allow(non_snake_case)]
 fn bench_squared_mat_muls(c: &mut Criterion) {
     let mut group = c.benchmark_group("squared mat mul");
-    let max_dimension = 100;
+    group.sample_size(10);
+    let max_dimension = 50;
     let step = 10;
 
     let mut freivalds_params_cache = ParamsKZGCache { k: 0, params: None };

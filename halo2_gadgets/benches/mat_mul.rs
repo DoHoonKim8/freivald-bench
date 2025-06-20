@@ -43,36 +43,39 @@ impl ParamsKZGCache {
     }
 }
 
+/// [HxW][Wx1]
 #[allow(non_snake_case)]
 fn freivalds_setup<'a>(
-    N: usize,
+    H: usize,
+    W: usize,
     cache: &'a mut ParamsKZGCache,
 ) -> (
     &'a ParamsKZG<Bn256>,
     FreivaldCircuit<Fr>,
     ProvingKey<G1Affine>,
 ) {
-    let K = log2_floor(N * N - 1) + 1;
+    let K = log2_floor(W * H - 1) + 1;
     let params = cache.fetch_params(K);
 
-    let A = Array::<Fr>::rand(&mut OsRng, N, N);
-    let B = Array::<Fr>::rand(&mut OsRng, N, N);
+    let A = Array::<Fr>::rand(&mut OsRng, W, H);
+    let B = Array::<Fr>::rand(&mut OsRng, 1, W);
     let C = A.mat_mul(&B);
 
     // Sanity check in plaintext
     {
-        let r: Vec<Value<Fr>> = (0..N).map(|_| Value::known(Fr::random(OsRng))).collect();
+        let r: Vec<Value<Fr>> = vec![Value::known(Fr::random(OsRng))];
 
         let b = B.vec_mul(&r);
         let c = C.vec_mul(&r);
         let Ab = A.vec_mul(&b);
+        assert!(Ab.len() == H && c.len() == H);
 
         Ab.iter()
             .zip(c.iter())
             .for_each(|(Ab, c)| (Ab - c).assert_if_known(|v| *v == Fr::ZERO));
     }
 
-    let circuit = FreivaldCircuit::new(A, B, C, N, N);
+    let circuit = FreivaldCircuit::new(A, B, C, H, W);
     let vk = keygen_vk(params, &circuit).expect("keygen_vk should not fail");
     let pk = keygen_pk(params, vk, &circuit).expect("keygen_pk should not fail");
     (params, circuit, pk)
@@ -99,8 +102,10 @@ fn run_freivalds(
     transcript.finalize();
 }
 
+/// `num_dot_products` * [1xN][Nx1]
 #[allow(non_snake_case)]
 fn dot_product_setup(
+    num_dot_products: u32,
     N: usize,
     cache: &mut ParamsKZGCache,
 ) -> (
@@ -110,13 +115,13 @@ fn dot_product_setup(
 ) {
     // current dot product circuit divides vector sets into 3 chunks
     let K = log2_floor(
-        ((N as u32 * ((N * N) as u32).div_ceil(3)) - 1)
+        ((N as u32 * num_dot_products.div_ceil(3)) - 1)
             .try_into()
             .unwrap(),
     ) + 1;
     let params = cache.fetch_params(K);
     // should set up the circuit for N^2 dot products
-    let values = (0..N * N)
+    let values = (0..num_dot_products)
         .map(|_| {
             let a = (0..N)
                 .map(|_| Value::known(Fr::random(&mut OsRng)))
@@ -158,25 +163,28 @@ fn run_dot_product(
 fn bench_squared_mat_muls(c: &mut Criterion) {
     let mut group = c.benchmark_group("squared mat mul");
     group.sample_size(10);
-    let max_dimension = 50;
-    let step = 10;
+    let max_dimension = 10000;
+    let step = 1000;
 
     let mut freivalds_params_cache = ParamsKZGCache { k: 0, params: None };
     let mut dot_product_params_cache = ParamsKZGCache { k: 0, params: None };
+    let num_dot_products = 3;
 
     (0..=max_dimension)
         .into_iter()
         .step_by(step)
         .skip(1)
         .for_each(|N: usize| {
-            let (params, circuit, pk) = freivalds_setup(N, &mut freivalds_params_cache);
+            let (params, circuit, pk) =
+                freivalds_setup(num_dot_products, N, &mut freivalds_params_cache);
             group.bench_with_input(
                 BenchmarkId::new("run_freivalds", N),
                 &(params, circuit, pk),
                 |b, (params, circuit, pk)| b.iter(|| run_freivalds(params, circuit, pk)),
             );
 
-            let (params, circuit, pk) = dot_product_setup(N, &mut dot_product_params_cache);
+            let (params, circuit, pk) =
+                dot_product_setup(num_dot_products as u32, N, &mut dot_product_params_cache);
             group.bench_with_input(
                 BenchmarkId::new("run_dot_product", N),
                 &(params, circuit, pk),

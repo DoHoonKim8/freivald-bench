@@ -120,7 +120,6 @@ fn dot_product_setup(
             .unwrap(),
     ) + 1;
     let params = cache.fetch_params(K);
-    // should set up the circuit for N^2 dot products
     let values = (0..num_dot_products)
         .map(|_| {
             let a = (0..N)

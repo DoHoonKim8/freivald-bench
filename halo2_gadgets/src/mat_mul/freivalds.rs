@@ -29,6 +29,7 @@ use halo2_proofs::{
     },
     transcript::{Blake2bWrite, Challenge255, TranscriptWriterBuffer},
 };
+use itertools::Itertools;
 use rand::{rngs::OsRng, RngCore};
 
 /// Matrix type
@@ -118,16 +119,13 @@ fn dot_product<F: Field>(left: &[Value<F>], right: &[Value<F>]) -> Value<F> {
 /// Freivald algorithm circuit configuration
 #[derive(Clone, Debug)]
 #[allow(non_snake_case)]
-pub struct FreivaldConfig {
-    /// Vertically stack the rows of A
+pub struct FreivaldConfig<const NUM_INNER_COLS_A: usize, const NUM_INNER_COLS_B: usize> {
     /// Each row has W elements; there are H rows
-    A: Column<Advice>,
-    /// Vertically stack the rows of B
+    A: [Column<Advice>; NUM_INNER_COLS_A],
     /// Each row has H elements; there are W rows
-    B: Column<Advice>,
-    /// Vertically stack the rows of C
+    B: [Column<Advice>; NUM_INNER_COLS_B],
     /// Each row has H elements; there are H rows
-    C: Column<Advice>,
+    C: [Column<Advice>; NUM_INNER_COLS_B],
     /// Matrix-vector mul B • r
     Br: Column<Advice>,
     q_Br: (Selector, Selector),
@@ -135,22 +133,24 @@ pub struct FreivaldConfig {
     Cr: Column<Advice>,
     q_Cr: (Selector, Selector),
     /// Matrix-vector mul A • (B • r)
-    ABr: (Column<Advice>, Column<Advice>),
+    ABr: ([Column<Advice>; NUM_INNER_COLS_A], Column<Advice>),
     q_ABr: (Selector, Selector),
     r: Challenge,
 }
 
 #[allow(non_snake_case)]
-impl FreivaldConfig {
+impl<const NUM_INNER_COLS_A: usize, const NUM_INNER_COLS_B: usize>
+    FreivaldConfig<NUM_INNER_COLS_A, NUM_INNER_COLS_B>
+{
     fn configure<F: Field>(meta: &mut ConstraintSystem<F>) -> Self {
         let q_Br = (meta.selector(), meta.selector());
         let q_Cr = (meta.selector(), meta.selector());
         let q_ABr = (meta.selector(), meta.selector());
 
         // First phase
-        let A = meta.advice_column_in(FirstPhase);
-        let B = meta.advice_column_in(FirstPhase);
-        let C = meta.advice_column_in(FirstPhase);
+        let A = [(); NUM_INNER_COLS_A].map(|_| meta.advice_column_in(FirstPhase));
+        let B = [(); NUM_INNER_COLS_B].map(|_| meta.advice_column_in(FirstPhase));
+        let C = [(); NUM_INNER_COLS_B].map(|_| meta.advice_column_in(FirstPhase));
 
         let r = meta.challenge_usable_after(FirstPhase);
 
@@ -158,74 +158,112 @@ impl FreivaldConfig {
         let Br = meta.advice_column_in(SecondPhase);
         let Cr = meta.advice_column_in(SecondPhase);
         let ABr = (
-            meta.advice_column_in(SecondPhase),
+            [(); NUM_INNER_COLS_A].map(|_| meta.advice_column_in(SecondPhase)),
             meta.advice_column_in(SecondPhase),
         );
 
         meta.enable_equality(Br);
         meta.enable_equality(Cr);
-        meta.enable_equality(ABr.0);
+        ABr.0.iter().for_each(|col| meta.enable_equality(*col));
         meta.enable_equality(ABr.1);
 
-        meta.create_gate("Br[0] = B[0] • r", |_| {
-            let q_Br_init = q_Br.0.expr();
-            let B = B.cur();
-            let Br = Br.cur();
-            let r = r.expr();
+        let powers_of_r = (0..NUM_INNER_COLS_B)
+            .scan(Expression::Constant(F::ONE), |r_power, _| {
+                *r_power = r_power.clone() * r.expr();
+                Some(r_power.clone())
+            })
+            .collect_vec()
+            .into_iter()
+            .rev()
+            .collect_vec();
+        let r_powered_to_num_inner_cols = powers_of_r[0].clone() * r.expr();
 
-            vec![q_Br_init * (Br - B * r)]
-        });
+        meta.create_gate(
+            "Br[0] = ∑_{i=0}^{NUM_INNER_COLS - 1} B[0][i] * r^{NUM_INNER_COLS - i - 1}",
+            |_| {
+                let q_Br_init = q_Br.0.expr();
+                let B_times_r = B
+                    .iter()
+                    .zip(powers_of_r.iter())
+                    .map(|(b, r_power)| b.cur() * r_power.clone())
+                    .sum();
+                let Br = Br.cur();
 
-        // ∑ B[i] • r^{n - i}
-        meta.create_gate("Br[i] = r * (Br[i - 1] + B[i])", |_| {
+                vec![q_Br_init * (Br - B_times_r)]
+            },
+        );
+
+        meta.create_gate("Br[j] = r^{NUM_INNER_COLS} * Br[j - 1] + ∑ ...", |_| {
             let q_Br = q_Br.1.expr();
-            let B = B.cur();
+            let B_times_r = B
+                .iter()
+                .zip(powers_of_r.iter())
+                .map(|(b, r_power)| b.cur() * r_power.clone())
+                .sum();
             let Br_prev = Br.prev();
             let Br = Br.cur();
-            let r = r.expr();
 
-            vec![q_Br * (Br - r * (B + Br_prev))]
+            vec![q_Br * (Br - (Br_prev * r_powered_to_num_inner_cols.clone() + B_times_r))]
         });
 
-        // ∑ C[i] • r^{n - i}
-        meta.create_gate("Cr[0] = C[0] • r", |_| {
-            let q_Cr_init = q_Cr.0.expr();
-            let C = C.cur();
-            let Cr = Cr.cur();
-            let r = r.expr();
+        meta.create_gate(
+            "Cr[0] = ∑_{i=0}^{NUM_INNER_COLS - 1} C[0][i] * r^{NUM_INNER_COLS - i - 1}",
+            |_| {
+                let q_Cr_init = q_Cr.0.expr();
+                let C_times_r = C
+                    .iter()
+                    .zip(powers_of_r.iter())
+                    .map(|(c, r_power)| c.cur() * r_power.clone())
+                    .sum();
+                let Cr = Cr.cur();
 
-            vec![q_Cr_init * (Cr - C * r)]
-        });
+                vec![q_Cr_init * (Cr - C_times_r)]
+            },
+        );
 
-        meta.create_gate("Cr[i] = r * (Cr[i - 1] + C[i])", |_| {
+        meta.create_gate("Cr[j] = r^{NUM_INNER_COLS} * Cr[j - 1] + ∑ ...", |_| {
             let q_Cr = q_Cr.1.expr();
-            let C = C.cur();
+            let C_times_r = C
+                .iter()
+                .zip(powers_of_r.iter())
+                .map(|(c, r_power)| c.cur() * r_power.clone())
+                .sum();
             let Cr_prev = Cr.prev();
             let Cr = Cr.cur();
-            let r = r.expr();
 
-            vec![q_Cr * (Cr - r * (C + Cr_prev))]
+            vec![q_Cr * (Cr - (Cr_prev * r_powered_to_num_inner_cols + C_times_r))]
         });
 
-        meta.create_gate("ABr[0] = A[0] • Br[0]", |_| {
-            let q_ABr_init = q_ABr.0.expr();
-            let A = A.cur();
-            let Br = ABr.0.cur();
-            let ABr = ABr.1.cur();
+        meta.create_gate(
+            "ABr[0] = ∑_{i=0}^{NUM_INNER_COLS - 1} A[0][i] * Br[0][i]",
+            |_| {
+                let q_ABr_init = q_ABr.0.expr();
+                let A_times_Br = A
+                    .iter()
+                    .zip(ABr.0.iter())
+                    .map(|(a, br)| a.cur() * br.cur())
+                    .sum();
+                let ABr = ABr.1.cur();
 
-            vec![q_ABr_init * (ABr - A * Br)]
-        });
+                vec![q_ABr_init * (ABr - A_times_Br)]
+            },
+        );
 
-        // ∑ A[i] • Br[i]
-        meta.create_gate("ABr[i] = ABr[i-1] + A[i] * Br[i]", |_| {
-            let q_ABr = q_ABr.1.expr();
-            let A = A.cur();
-            let Br = ABr.0.cur();
-            let ABr_prev = ABr.1.prev();
-            let ABr = ABr.1.cur();
+        meta.create_gate(
+            "ABr[j] = ABr[j-1] + ∑_{i=0}^{NUM_INNER_COLS - 1} A[j][i] * Br[j][i]",
+            |_| {
+                let q_ABr = q_ABr.1.expr();
+                let A_times_Br = A
+                    .iter()
+                    .zip(ABr.0.iter())
+                    .map(|(a, br)| a.cur() * br.cur())
+                    .sum();
+                let ABr_prev = ABr.1.prev();
+                let ABr = ABr.1.cur();
 
-            vec![q_ABr * (ABr - (ABr_prev + A * Br))]
-        });
+                vec![q_ABr * (ABr - (ABr_prev + A_times_Br))]
+            },
+        );
 
         Self {
             A,
@@ -245,7 +283,7 @@ impl FreivaldConfig {
 /// Freivald algorithm circuit
 #[derive(Clone, Debug)]
 #[allow(non_snake_case)]
-pub struct FreivaldCircuit<F: Field> {
+pub struct FreivaldCircuit<F: Field, const NUM_INNER_COLS_A: usize, const NUM_INNER_COLS_B: usize> {
     // H x W
     A: Array<F>,
     // W x H
@@ -256,7 +294,9 @@ pub struct FreivaldCircuit<F: Field> {
     W: usize,
 }
 
-impl<F: Field> FreivaldCircuit<F> {
+impl<F: Field, const NUM_INNER_COLS_A: usize, const NUM_INNER_COLS_B: usize>
+    FreivaldCircuit<F, NUM_INNER_COLS_A, NUM_INNER_COLS_B>
+{
     /// Create Freivald algorithm circuit
     #[allow(non_snake_case)]
     pub fn new(A: Array<F>, B: Array<F>, C: Array<F>, H: usize, W: usize) -> Self {
@@ -265,8 +305,10 @@ impl<F: Field> FreivaldCircuit<F> {
 }
 
 #[allow(non_snake_case)]
-impl<F: Field> Circuit<F> for FreivaldCircuit<F> {
-    type Config = FreivaldConfig;
+impl<F: Field, const NUM_INNER_COLS_A: usize, const NUM_INNER_COLS_B: usize> Circuit<F>
+    for FreivaldCircuit<F, NUM_INNER_COLS_A, NUM_INNER_COLS_B>
+{
+    type Config = FreivaldConfig<NUM_INNER_COLS_A, NUM_INNER_COLS_B>;
     type FloorPlanner = V1;
     #[cfg(feature = "circuit-params")]
     type Params = ();
@@ -276,7 +318,7 @@ impl<F: Field> Circuit<F> for FreivaldCircuit<F> {
     }
 
     fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
-        FreivaldConfig::configure(meta)
+        FreivaldConfig::<NUM_INNER_COLS_A, NUM_INNER_COLS_B>::configure(meta)
     }
 
     fn synthesize(
@@ -285,6 +327,16 @@ impl<F: Field> Circuit<F> for FreivaldCircuit<F> {
         mut layouter: impl Layouter<F>,
     ) -> Result<(), Error> {
         let r = layouter.get_challenge(config.r);
+        let powers_of_r = (0..NUM_INNER_COLS_B)
+            .scan(Value::known(F::ONE), |r_power, _| {
+                *r_power = *r_power * r;
+                Some(*r_power)
+            })
+            .collect_vec()
+            .into_iter()
+            .rev()
+            .collect_vec();
+        let r_powered_to_num_inner_cols_b = powers_of_r[0] * r;
 
         let Br = layouter.assign_region(
             || "B • r",
@@ -292,17 +344,36 @@ impl<F: Field> Circuit<F> for FreivaldCircuit<F> {
                 let mut Br_cells = vec![];
 
                 for (row_idx, row) in self.B.transpose().vals.iter().enumerate() {
-                    let running_sum = row.iter().scan(Value::known(F::ZERO), |state, val| {
-                        *state = (*state + val) * r;
-                        Some(*state)
-                    });
+                    let chunked_row = row.iter().chunks(NUM_INNER_COLS_B);
+                    let running_sum =
+                        chunked_row
+                            .into_iter()
+                            .scan(Value::known(F::ZERO), |state, val| {
+                                let curr_sum: Value<F> = val
+                                    .into_iter()
+                                    .zip(powers_of_r.iter())
+                                    .map(|(v, r_power)| *v * *r_power)
+                                    .reduce(|acc, v| acc + v)
+                                    .unwrap();
+                                *state = *state * r_powered_to_num_inner_cols_b + curr_sum;
+                                Some(*state)
+                            });
+                    for (idx, (b_vals, br)) in row
+                        .iter()
+                        .chunks(NUM_INNER_COLS_B)
+                        .into_iter()
+                        .zip(running_sum)
+                        .enumerate()
+                    {
+                        let offset = row_idx * self.B.num_cols() / NUM_INNER_COLS_B + idx;
 
-                    for (idx, (b, br)) in row.iter().zip(running_sum).enumerate() {
-                        let offset = row_idx * self.B.num_cols() + idx;
-
-                        region.assign_advice(|| "", config.B, offset, || *b)?;
+                        b_vals
+                            .into_iter()
+                            .zip(config.B)
+                            .map(|(b, b_col)| region.assign_advice(|| "", b_col, offset, || *b))
+                            .collect::<Result<Vec<_>, Error>>()?;
                         let Br = region.assign_advice(|| "", config.Br, offset, || br)?;
-                        if idx == self.H - 1 {
+                        if idx == self.B.num_cols() / NUM_INNER_COLS_B {
                             Br_cells.push(Br);
                         }
 
@@ -324,17 +395,37 @@ impl<F: Field> Circuit<F> for FreivaldCircuit<F> {
                 let mut Cr_cells = vec![];
 
                 for (row_idx, row) in self.C.transpose().vals.iter().enumerate() {
-                    let running_sum = row.iter().scan(Value::known(F::ZERO), |state, val| {
-                        *state = (*state + val) * r;
-                        Some(*state)
-                    });
+                    let running_sum = row
+                        .iter()
+                        .chunks(NUM_INNER_COLS_B)
+                        .into_iter()
+                        .scan(Value::known(F::ZERO), |state, val| {
+                            let curr_sum: Value<F> = val
+                                .into_iter()
+                                .zip(powers_of_r.iter())
+                                .map(|(v, r_power)| *v * *r_power)
+                                .reduce(|acc, v| acc + v)
+                                .unwrap();
+                            *state = *state * r_powered_to_num_inner_cols_b + curr_sum;
+                            Some(*state)
+                        })
+                        .collect_vec();
+                    for (idx, (c_vals, cr)) in row
+                        .iter()
+                        .chunks(NUM_INNER_COLS_B)
+                        .into_iter()
+                        .zip(running_sum)
+                        .enumerate()
+                    {
+                        let offset = row_idx * self.C.num_cols() / NUM_INNER_COLS_B + idx;
 
-                    for (idx, (c, cr)) in row.iter().zip(running_sum).enumerate() {
-                        let offset = row_idx * self.C.num_cols() + idx;
-
-                        region.assign_advice(|| "", config.C, offset, || *c)?;
+                        c_vals
+                            .into_iter()
+                            .zip(config.C)
+                            .map(|(c, c_col)| region.assign_advice(|| "", c_col, offset, || *c))
+                            .collect::<Result<Vec<_>, Error>>()?;
                         let Cr = region.assign_advice(|| "", config.Cr, offset, || cr)?;
-                        if idx == self.H - 1 {
+                        if idx == self.C.num_cols() / NUM_INNER_COLS_B {
                             Cr_cells.push(Cr);
                         }
 
@@ -360,21 +451,44 @@ impl<F: Field> Circuit<F> for FreivaldCircuit<F> {
 
                 let mut ABr_cells = vec![];
                 for (row_idx, row) in self.A.transpose().vals.iter().enumerate() {
-                    let running_sum = row.iter().zip(Br_vals.iter()).scan(
-                        Value::known(F::ZERO),
-                        |state, (a, br)| {
-                            *state = *state + *a * br;
-                            Some(*state)
-                        },
-                    );
+                    let running_sum = row
+                        .into_iter()
+                        .zip(Br_vals.iter())
+                        .chunks(NUM_INNER_COLS_A)
+                        .into_iter()
+                        .scan(Value::known(F::ZERO), |state, vals| {
+                            let curr_sum = vals
+                                .into_iter()
+                                .fold(Value::known(F::ZERO), |acc, (v, br)| acc + *v * br);
+                            Some(*state + curr_sum)
+                        })
+                        .collect_vec();
 
-                    for (idx, ((a, br), abr)) in
-                        row.iter().zip(Br.iter()).zip(running_sum).enumerate()
+                    for (idx, vals) in row
+                        .iter()
+                        .zip(Br.iter())
+                        .chunks(NUM_INNER_COLS_A)
+                        .into_iter()
+                        .enumerate()
                     {
-                        let offset = row_idx * self.A.num_cols() + idx;
-                        region.assign_advice(|| "", config.A, offset, || *a)?;
-                        br.copy_advice(|| "", &mut region, config.ABr.0, offset)?;
-                        let ABr = region.assign_advice(|| "", config.ABr.1, offset, || abr)?;
+                        let offset = row_idx * self.A.num_cols() / NUM_INNER_COLS_A + idx;
+                        let (a_vals, br_cells): (Vec<_>, Vec<_>) = vals.into_iter().unzip();
+                        a_vals
+                            .into_iter()
+                            .zip(config.A)
+                            .map(|(a, a_col)| region.assign_advice(|| "", a_col, offset, || a))
+                            .collect::<Result<Vec<_>, Error>>()?;
+                        br_cells
+                            .into_iter()
+                            .zip(config.ABr.0)
+                            .map(|(br, br_col)| br.copy_advice(|| "", &mut region, br_col, offset))
+                            .collect::<Result<Vec<_>, Error>>()?;
+                        let ABr = region.assign_advice(
+                            || "",
+                            config.ABr.1,
+                            offset,
+                            || running_sum[idx],
+                        )?;
 
                         if idx == 0 {
                             config.q_ABr.0.enable(&mut region, offset)?;
@@ -382,7 +496,7 @@ impl<F: Field> Circuit<F> for FreivaldCircuit<F> {
                             config.q_ABr.1.enable(&mut region, offset)?;
                         }
 
-                        if idx == self.W - 1 {
+                        if idx == self.A.num_cols() / NUM_INNER_COLS_A - 1 {
                             ABr_cells.push(ABr);
                         }
                     }

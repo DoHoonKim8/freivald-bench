@@ -4,7 +4,7 @@ use halo2_gadgets::mat_mul::{
     dot_product::DotProductCircuit,
     freivalds::{Array, FreivaldCircuit},
 };
-use halo2_proofs::halo2curves::bn256::Fr;
+use halo2_proofs::{dev::MockProver, halo2curves::bn256::Fr};
 use halo2_proofs::{
     arithmetic::log2_floor,
     circuit::Value,
@@ -43,27 +43,27 @@ impl ParamsKZGCache {
     }
 }
 
-/// [HxW][Wx1]
+/// [HxW][WxH]
 #[allow(non_snake_case)]
-fn freivalds_setup<'a>(
+fn freivalds_setup<'a, const NUM_INNER_COLS_A: usize, const NUM_INNER_COLS_B: usize>(
     H: usize,
     W: usize,
     cache: &'a mut ParamsKZGCache,
 ) -> (
     &'a ParamsKZG<Bn256>,
-    FreivaldCircuit<Fr>,
+    FreivaldCircuit<Fr, NUM_INNER_COLS_A, NUM_INNER_COLS_B>,
     ProvingKey<G1Affine>,
 ) {
-    let K = log2_floor(W * H - 1) + 1;
+    let K = log2_floor(W * H / NUM_INNER_COLS_A - 1) + 1;
     let params = cache.fetch_params(K);
 
     let A = Array::<Fr>::rand(&mut OsRng, W, H);
-    let B = Array::<Fr>::rand(&mut OsRng, 1, W);
+    let B = Array::<Fr>::rand(&mut OsRng, H, W);
     let C = A.mat_mul(&B);
 
     // Sanity check in plaintext
     {
-        let r: Vec<Value<Fr>> = vec![Value::known(Fr::random(OsRng))];
+        let r: Vec<Value<Fr>> = vec![Value::known(Fr::random(OsRng)); 4];
 
         let b = B.vec_mul(&r);
         let c = C.vec_mul(&r);
@@ -74,17 +74,19 @@ fn freivalds_setup<'a>(
             .zip(c.iter())
             .for_each(|(Ab, c)| (Ab - c).assert_if_known(|v| *v == Fr::ZERO));
     }
+    let circuit = FreivaldCircuit::<Fr, NUM_INNER_COLS_A, NUM_INNER_COLS_B>::new(A, B, C, H, W);
+    let mock_prover = MockProver::run(K, &circuit, vec![]).unwrap();
+    assert_eq!(mock_prover.verify(), Ok(()));
 
-    let circuit = FreivaldCircuit::new(A, B, C, H, W);
     let vk = keygen_vk(params, &circuit).expect("keygen_vk should not fail");
     let pk = keygen_pk(params, vk, &circuit).expect("keygen_pk should not fail");
     (params, circuit, pk)
 }
 
 #[allow(non_snake_case)]
-fn run_freivalds(
+fn run_freivalds<const NUM_INNER_COLS_A: usize, const NUM_INNER_COLS_B: usize>(
     params: &ParamsKZG<Bn256>,
-    circuit: &FreivaldCircuit<Fr>,
+    circuit: &FreivaldCircuit<Fr, NUM_INNER_COLS_A, NUM_INNER_COLS_B>,
     pk: &ProvingKey<G1Affine>,
 ) {
     let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
@@ -162,24 +164,36 @@ fn run_dot_product(
 fn bench_squared_mat_muls(c: &mut Criterion) {
     let mut group = c.benchmark_group("squared mat mul");
     group.sample_size(10);
-    let max_dimension = 10000;
+    let max_dimension = 6000;
     let step = 1000;
 
     let mut freivalds_params_cache = ParamsKZGCache { k: 0, params: None };
     let mut dot_product_params_cache = ParamsKZGCache { k: 0, params: None };
     let num_dot_products = 3;
 
+    // currently this should divide the number of columns of matrix A
+    const NUM_INNER_COLS_A: usize = 2;
+    // currently this should divide the number of columns of matrix B
+    const NUM_INNER_COLS_B: usize = 2;
+
     (0..=max_dimension)
         .into_iter()
         .step_by(step)
         .skip(1)
         .for_each(|N: usize| {
-            let (params, circuit, pk) =
-                freivalds_setup(num_dot_products, N, &mut freivalds_params_cache);
+            let (params, circuit, pk) = freivalds_setup::<NUM_INNER_COLS_A, NUM_INNER_COLS_B>(
+                4,
+                N,
+                &mut freivalds_params_cache,
+            );
             group.bench_with_input(
                 BenchmarkId::new("run_freivalds", N),
                 &(params, circuit, pk),
-                |b, (params, circuit, pk)| b.iter(|| run_freivalds(params, circuit, pk)),
+                |b, (params, circuit, pk)| {
+                    b.iter(|| {
+                        run_freivalds::<NUM_INNER_COLS_A, NUM_INNER_COLS_B>(params, circuit, pk)
+                    })
+                },
             );
 
             let (params, circuit, pk) =
